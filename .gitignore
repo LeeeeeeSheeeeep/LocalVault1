@@ -1,0 +1,16 @@
+# Binaries and executable files
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Local Databases and dynamic configs
+data/
+*.db
+deadman.json
+
+# IDE / System files
+.DS_Store
+.idea/
+.vscode/
