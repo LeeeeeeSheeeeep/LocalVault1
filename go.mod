@@ -3,6 +3,7 @@ module localvault
 go 1.26.1
 
 require (
+	github.com/cloudflare/circl v1.6.3
 	github.com/google/uuid v1.6.0
 	modernc.org/sqlite v1.51.0
 )

@@ -2,6 +2,7 @@ package security
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -46,7 +47,7 @@ func (dm *DuressManager) saveConfig() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(dm.configPath, data, 0644)
+	return os.WriteFile(dm.configPath, data, 0600)
 }
 
 func (dm *DuressManager) hashPassword(password, salt string) string {
@@ -59,10 +60,10 @@ func (dm *DuressManager) hashPassword(password, salt string) string {
 // (isValid, isDuress)
 func (dm *DuressManager) Authenticate(password string) (bool, bool) {
 	inputHash := dm.hashPassword(password, dm.config.Salt)
-	if inputHash == dm.config.MasterHash {
+	if subtle.ConstantTimeCompare([]byte(inputHash), []byte(dm.config.MasterHash)) == 1 {
 		return true, false
 	}
-	if inputHash == dm.config.DuressHash {
+	if subtle.ConstantTimeCompare([]byte(inputHash), []byte(dm.config.DuressHash)) == 1 {
 		return true, true
 	}
 	return false, false

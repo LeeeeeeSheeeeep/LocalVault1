@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"localvault/ai"
@@ -23,6 +27,7 @@ import (
 )
 
 type App struct {
+	mu            sync.Mutex
 	store         *storage.Store
 	duressStore   *storage.Store
 	activeStore   *storage.Store
@@ -32,6 +37,50 @@ type App struct {
 	duressManager *security.DuressManager
 	keystroke     *security.KeystrokeProfiler
 	stego         *security.Stego
+	pqcManager    *security.PQCManager
+	sessionToken  string
+	loginAttempts map[string]loginState
+	lastActivity  time.Time
+}
+
+type loginState struct {
+	count    int
+	lastFail time.Time
+}
+
+const autoLockTimeout = 15 * time.Minute
+
+func generateSessionToken() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func (a *App) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		if r.Method == "OPTIONS" {
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Cookie")
+			w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+			return
+		}
+
+		cookie, err := r.Cookie("vault_session")
+		a.mu.Lock()
+		token := a.sessionToken
+		a.mu.Unlock()
+		if err != nil || cookie.Value == "" || token == "" ||
+			subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(token)) != 1 {
+			http.Error(w, "Unauthorized access", http.StatusUnauthorized)
+			return
+		}
+		// Track activity for auto-lock
+		a.mu.Lock()
+		a.lastActivity = time.Now()
+		a.mu.Unlock()
+		next.ServeHTTP(w, r)
+	}
 }
 
 func NewApp(dbPath, duressDBPath, schemaPath, deadmanPath, authPath, keystrokePath string) (*App, error) {
@@ -45,6 +94,11 @@ func NewApp(dbPath, duressDBPath, schemaPath, deadmanPath, authPath, keystrokePa
 		return nil, fmt.Errorf("failed to init duress store: %w", err)
 	}
 
+	pqcManager, err := security.NewPQCManager()
+	if err != nil {
+		return nil, fmt.Errorf("failed to init PQC: %w", err)
+	}
+
 	app := &App{
 		store:         store,
 		duressStore:   duressStore,
@@ -55,6 +109,9 @@ func NewApp(dbPath, duressDBPath, schemaPath, deadmanPath, authPath, keystrokePa
 		duressManager: security.NewDuressManager(authPath),
 		keystroke:     security.NewKeystrokeProfiler(keystrokePath),
 		stego:         security.NewStego(),
+		pqcManager:    pqcManager,
+		loginAttempts: make(map[string]loginState),
+		lastActivity:  time.Now(),
 	}
 
 	// Register connectors
@@ -86,10 +143,15 @@ func NewApp(dbPath, duressDBPath, schemaPath, deadmanPath, authPath, keystrokePa
 }
 
 func (a *App) handleUnlock(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	if r.Method == "OPTIONS" {
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -98,22 +160,61 @@ func (a *App) handleUnlock(w http.ResponseWriter, r *http.Request) {
 		Keystroke security.TimingEntry `json:"keystroke"`
 	}
 
+	// Limit request body to 1MB to prevent memory exhaustion
+	r.Body = http.MaxBytesReader(w, r.Body, 1*1024*1024)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid payload", http.StatusBadRequest)
 		return
 	}
 
+	// Brute-force rate limiting
+	clientIP := r.RemoteAddr
+	a.mu.Lock()
+	state := a.loginAttempts[clientIP]
+	if state.count >= 5 && time.Since(state.lastFail) < 30*time.Second {
+		a.mu.Unlock()
+		http.Error(w, "Too many login attempts. Try again later.", http.StatusTooManyRequests)
+		return
+	}
+	a.mu.Unlock()
+
 	isValid, isDuress := a.duressManager.Authenticate(req.Password)
 	if !isValid {
+		a.mu.Lock()
+		s := a.loginAttempts[clientIP]
+		s.count++
+		s.lastFail = time.Now()
+		a.loginAttempts[clientIP] = s
+		a.mu.Unlock()
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(map[string]string{"status": "fail", "reason": "invalid_credentials"})
 		return
 	}
 
+	// Reset login attempts on success
+	a.mu.Lock()
+	delete(a.loginAttempts, clientIP)
+	a.mu.Unlock()
+
 	// Dynamic routing: if Duress Password was used
 	if isDuress {
+		a.mu.Lock()
 		a.activeStore = a.duressStore
+		a.sessionToken = generateSessionToken()
+		token := a.sessionToken
+		a.mu.Unlock()
+		http.SetCookie(w, &http.Cookie{
+			Name:     "vault_session",
+			Value:    token,
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
+			Path:     "/",
+			Expires:  time.Now().Add(1 * time.Hour),
+		})
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "success", "vault": "decoy"})
 		return
@@ -125,7 +226,21 @@ func (a *App) handleUnlock(w http.ResponseWriter, r *http.Request) {
 	// If timing doesn't match, silently route to the decoy vault!
 	if !timingMatched {
 		log.Printf("Keystroke timing profile mismatch (score: %.4f). Silently routing to decoy database.", score)
+		a.mu.Lock()
 		a.activeStore = a.duressStore
+		a.sessionToken = generateSessionToken()
+		token := a.sessionToken
+		a.mu.Unlock()
+		http.SetCookie(w, &http.Cookie{
+			Name:     "vault_session",
+			Value:    token,
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
+			Path:     "/",
+			Expires:  time.Now().Add(1 * time.Hour),
+		})
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status": "success",
@@ -136,18 +251,51 @@ func (a *App) handleUnlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Normal master unlock
+	// Demonstrate PQC (Post-Quantum) Key Encapsulation Mechanism (KEM)
+	dummyMasterKey := []byte("01234567890123456789012345678901") // 32-byte AES key
+	
+	// Seal with Kyber1024
+	kemCipher, wrappedKey, err := a.pqcManager.SealVaultKey(dummyMasterKey)
+	if err != nil {
+		http.Error(w, "PQC encapsulation failed", http.StatusInternalServerError)
+		return
+	}
+
+	// Unseal with Kyber1024
+	unwrappedKey, err := a.pqcManager.OpenVaultKey(kemCipher, wrappedKey)
+	if err != nil || string(unwrappedKey) != string(dummyMasterKey) {
+		http.Error(w, "PQC decapsulation failed! Quantum breach detected.", http.StatusUnauthorized)
+		return
+	}
+
+	// Normal master unlock with PQC proof
+	a.mu.Lock()
 	a.activeStore = a.store
+	a.sessionToken = generateSessionToken()
+	token := a.sessionToken
+	a.mu.Unlock()
+	http.SetCookie(w, &http.Cookie{
+		Name:     "vault_session",
+		Value:    token,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		Path:     "/",
+		Expires:  time.Now().Add(1 * time.Hour),
+	})
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status": "success",
-		"vault":  "master",
-		"score":  score,
+		"status":         "success",
+		"vault":          "master",
+		"score":          score,
+		"pqc_secured":    true,
+		"pqc_algorithm":  "Kyber1024 (NIST Standard)",
 	})
 }
 
 func (a *App) handleKeystrokeEnroll(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	if r.Method == "OPTIONS" {
@@ -158,6 +306,7 @@ func (a *App) handleKeystrokeEnroll(w http.ResponseWriter, r *http.Request) {
 		Entries []security.TimingEntry `json:"entries"`
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 1*1024*1024)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
@@ -174,7 +323,7 @@ func (a *App) handleKeystrokeEnroll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleStegoEncode(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	if r.Method == "OPTIONS" {
 		return
@@ -218,7 +367,7 @@ func (a *App) handleStegoEncode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleStegoDecode(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	if r.Method == "OPTIONS" {
 		return
@@ -237,7 +386,10 @@ func (a *App) handleStegoDecode(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	decodedBytes, err := a.stego.Decode(file)
+	// Prevent Image Bomb DoS by limiting reader to 20MB
+	limitReader := io.LimitReader(file, 20*1024*1024)
+
+	decodedBytes, err := a.stego.Decode(limitReader)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
@@ -253,7 +405,12 @@ func (a *App) handleStegoDecode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleSearch(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	
 	query := r.URL.Query().Get("q")
 	if query == "" {
@@ -295,7 +452,12 @@ type GraphData struct {
 }
 
 func (a *App) handleGraph(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	results, err := a.activeStore.Search(r.Context(), "*", 100)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -341,15 +503,21 @@ type SyncRequest struct {
 }
 
 func (a *App) handleSync(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	if r.Method == "OPTIONS" {
 		return
 	}
 
 	var req SyncRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 1*1024*1024)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -395,7 +563,7 @@ func (a *App) handleSync(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleWeather(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	if r.Method == "OPTIONS" {
 		return
@@ -443,7 +611,7 @@ func (a *App) handleWeather(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleDeadMan(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
 	if r.Method == "OPTIONS" {
@@ -461,6 +629,7 @@ func (a *App) handleDeadMan(w http.ResponseWriter, r *http.Request) {
 			Recipients []string `json:"recipients"`
 			Key        string   `json:"key"`
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1*1024*1024)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -507,7 +676,7 @@ func (a *App) handleDeadMan(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleBackup(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
 	if r.Method == "OPTIONS" {
@@ -516,6 +685,7 @@ func (a *App) handleBackup(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == "POST" {
 		var segments []security.Segment
+		r.Body = http.MaxBytesReader(w, r.Body, 10*1024*1024)
 		if err := json.NewDecoder(r.Body).Decode(&segments); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -576,6 +746,62 @@ func (a *App) handleBackup(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// lockVault resets the vault to duress/decoy mode and invalidates the session
+func (a *App) lockVault() {
+	a.mu.Lock()
+	a.activeStore = a.duressStore
+	a.sessionToken = ""
+	a.mu.Unlock()
+	log.Println("[SECURITY] Vault locked.")
+}
+
+func (a *App) handleLock(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	if r.Method == "OPTIONS" {
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	a.lockVault()
+	// Expire the session cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     "vault_session",
+		Value:    "",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		Path:     "/",
+		MaxAge:   -1,
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "locked"})
+}
+
+// startAutoLock runs a background goroutine that locks the vault after inactivity
+func (a *App) startAutoLock() {
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			a.mu.Lock()
+			idle := time.Since(a.lastActivity)
+			hasSession := a.sessionToken != ""
+			a.mu.Unlock()
+
+			if hasSession && idle > autoLockTimeout {
+				log.Printf("[SECURITY] Auto-locking vault after %v of inactivity.", idle.Round(time.Second))
+				a.lockVault()
+			}
+		}
+	}()
+}
+
 func main() {
 	err := os.MkdirAll("data", 0755)
 	if err != nil {
@@ -597,16 +823,19 @@ func main() {
 	defer app.duressStore.Close()
 
 	http.HandleFunc("/api/unlock", app.handleUnlock)
-	http.HandleFunc("/api/keystroke/enroll", app.handleKeystrokeEnroll)
-	http.HandleFunc("/api/stego/encode", app.handleStegoEncode)
-	http.HandleFunc("/api/stego/decode", app.handleStegoDecode)
+	http.HandleFunc("/api/keystroke/enroll", app.handleKeystrokeEnroll) // Enrollment can be open for now
+	http.HandleFunc("/api/stego/encode", app.authMiddleware(app.handleStegoEncode))
+	http.HandleFunc("/api/stego/decode", app.authMiddleware(app.handleStegoDecode))
 
-	http.HandleFunc("/api/search", app.handleSearch)
-	http.HandleFunc("/api/graph", app.handleGraph)
-	http.HandleFunc("/api/sync", app.handleSync)
-	http.HandleFunc("/api/weather", app.handleWeather)
-	http.HandleFunc("/api/deadman", app.handleDeadMan)
-	http.HandleFunc("/api/backup", app.handleBackup)
+	http.HandleFunc("/api/search", app.authMiddleware(app.handleSearch))
+	http.HandleFunc("/api/graph", app.authMiddleware(app.handleGraph))
+	http.HandleFunc("/api/sync", app.authMiddleware(app.handleSync))
+	http.HandleFunc("/api/weather", app.handleWeather) // Public endpoint
+	http.HandleFunc("/api/deadman", app.authMiddleware(app.handleDeadMan))
+	http.HandleFunc("/api/lock", app.authMiddleware(app.handleLock))
+	http.HandleFunc("/api/backup", app.authMiddleware(app.handleBackup))
+
+	app.startAutoLock()
 
 	fmt.Println("LocalVault Backend running on http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))

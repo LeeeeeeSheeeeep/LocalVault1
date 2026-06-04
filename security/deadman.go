@@ -57,7 +57,7 @@ func (s *DeadManSwitch) SaveConfig() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.configPath, data, 0644)
+	return os.WriteFile(s.configPath, data, 0600)
 }
 
 // RecordHeartbeat logs a user activity signal to prevent switch triggering

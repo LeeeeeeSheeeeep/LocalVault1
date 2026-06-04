@@ -59,7 +59,7 @@ func (kp *KeystrokeProfiler) saveProfile() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(kp.profilePath, data, 0644)
+	return os.WriteFile(kp.profilePath, data, 0600)
 }
 
 // EnrollTrain builds a baseline profile from multiple training attempts

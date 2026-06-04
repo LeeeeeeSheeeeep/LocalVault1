@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"localvault/connectors"
@@ -32,6 +34,27 @@ func (c *RSSConnector) Auth(ctx context.Context, config map[string]string) error
 	if !ok || feedURL == "" {
 		return fmt.Errorf("RSS feed url is required")
 	}
+
+	u, err := url.Parse(feedURL)
+	if err != nil {
+		return fmt.Errorf("invalid url: %w", err)
+	}
+
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("only http and https schemes are allowed")
+	}
+
+	ips, err := net.LookupIP(u.Hostname())
+	if err != nil {
+		return fmt.Errorf("failed to resolve hostname: %w", err)
+	}
+
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() {
+			return fmt.Errorf("access to internal/private IP address is forbidden (SSRF protection)")
+		}
+	}
+
 	c.feedURL = feedURL
 	return nil
 }

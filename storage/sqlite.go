@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -83,6 +84,9 @@ func (s *Store) SaveDocument(ctx context.Context, doc *Document) error {
 
 // Search queries the FTS5 virtual table
 func (s *Store) Search(ctx context.Context, query string, limit int) ([]Document, error) {
+	// Sanitize query for FTS5 (escape quotes and wrap in literal quotes)
+	safeQuery := `"` + strings.ReplaceAll(query, `"`, `""`) + `"`
+
 	// Simple match syntax for FTS5
 	sqlQuery := `
 		SELECT id, doc_type, title, content, author
@@ -91,7 +95,7 @@ func (s *Store) Search(ctx context.Context, query string, limit int) ([]Document
 		ORDER BY rank
 		LIMIT ?
 	`
-	rows, err := s.db.QueryContext(ctx, sqlQuery, query, limit)
+	rows, err := s.db.QueryContext(ctx, sqlQuery, safeQuery, limit)
 	if err != nil {
 		return nil, err
 	}

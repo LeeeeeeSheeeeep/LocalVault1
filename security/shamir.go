@@ -129,11 +129,16 @@ func ReconstructSecret(shares []ShamirShare) ([]byte, error) {
 	secretLen := len(shares[0].Value)
 	numShares := len(shares)
 
-	// Check that all shares have matching sizes
+	// Check that all shares have matching sizes and unique indices
+	seenIndices := make(map[byte]bool)
 	for _, share := range shares {
 		if len(share.Value) != secretLen {
 			return nil, errors.New("all shares must have the same length")
 		}
+		if seenIndices[share.Index] {
+			return nil, errors.New("duplicate share index detected")
+		}
+		seenIndices[share.Index] = true
 	}
 
 	secret := make([]byte, secretLen)

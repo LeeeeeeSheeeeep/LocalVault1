@@ -127,7 +127,9 @@ func (m *QRBackupManager) RestoreBackup(segments []Segment) ([]byte, error) {
 	defer reader.Close()
 
 	var decompressedBuf bytes.Buffer
-	if _, err := io.Copy(&decompressedBuf, reader); err != nil {
+	// Cap decompressed output at 50MB to prevent zlib bomb attacks
+	limitedReader := io.LimitReader(reader, 50*1024*1024)
+	if _, err := io.Copy(&decompressedBuf, limitedReader); err != nil {
 		return nil, fmt.Errorf("zlib decompression failed: %w", err)
 	}
 
